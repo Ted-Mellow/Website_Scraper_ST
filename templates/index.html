@@ -252,11 +252,17 @@
             </div>
         </div>
 
-        <div style="margin-bottom: 20px; display: flex; align-items: center; gap: 8px;">
-            <input type="checkbox" id="useBrowser" style="width: 16px; height: 16px; cursor: pointer;">
-            <label for="useBrowser" style="margin: 0; cursor: pointer; font-size: 14px; color: #666;">
-                🌐 Use Browser (slower but works with JavaScript sites)
-            </label>
+        <div style="margin-bottom: 20px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <input type="checkbox" id="useBrowser" style="width: 16px; height: 16px; cursor: pointer;">
+                <label for="useBrowser" style="margin: 0; cursor: pointer; font-size: 14px; color: #666;">
+                    🌐 Use Browser Mode
+                </label>
+                <span id="modeInfo" style="font-size: 12px; color: #999;">⚡ Fast mode (~2-3 sec/page)</span>
+            </div>
+            <p style="font-size: 12px; color: #999; margin: 8px 0 0 24px; line-height: 1.4;">
+                Browser mode enables JavaScript rendering but takes 15-30 sec per page. Use only for React/Vue sites.
+            </p>
         </div>
 
         <div class="button-group">
@@ -308,26 +314,30 @@
             const maxPages = document.getElementById('maxPages').value;
             const useBrowser = document.getElementById('useBrowser').checked;
             const scrapeBtn = document.getElementById('scrapeBtn');
-            const status = document.getElementById('status');
 
             if (!url) {
                 showStatus('error', '❌ Please enter a URL');
                 return;
             }
 
-            // Show loading status
+            // Update mode info on browser mode change
             const mode = useBrowser ? '🌐 Browser mode' : '⚡ Fast mode';
             showStatus('loading', '<span class="spinner"></span>Scraping... This may take a moment (' + mode + ')');
             scrapeBtn.disabled = true;
             document.getElementById('resultsContainer').style.display = 'none';
 
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), useBrowser ? 600000 : 60000);
+
             try {
                 const response = await fetch('/scrape', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url, max_pages: maxPages, use_browser: useBrowser })
+                    body: JSON.stringify({ url, max_pages: maxPages, use_browser: useBrowser }),
+                    signal: controller.signal
                 });
 
+                clearTimeout(timeout);
                 const data = await response.json();
 
                 if (data.error) {
@@ -336,28 +346,55 @@
                     return;
                 }
 
+                // Validate response schema
+                if (!Array.isArray(data.results) || !data.results.every(r => r.name && r.url)) {
+                    showStatus('error', '❌ Invalid response from server');
+                    scrapeBtn.disabled = false;
+                    return;
+                }
+
+                // Store domain for CSV
+                currentDomain = data.domain;
+
                 // Display results
                 displayResults(data.results, data.method);
                 showStatus('success', `✓ Found ${data.count} companies using <strong>${data.method}</strong>`);
                 document.getElementById('downloadBtn').style.display = 'inline-block';
 
             } catch (error) {
-                showStatus('error', `❌ Error: ${error.message}`);
+                clearTimeout(timeout);
+                if (error.name === 'AbortError') {
+                    const timeoutMsg = useBrowser ? '10 minutes' : '1 minute';
+                    showStatus('error', `❌ Request timeout (${timeoutMsg} exceeded)`);
+                } else {
+                    showStatus('error', `❌ Error: ${error.message}`);
+                }
             } finally {
                 scrapeBtn.disabled = false;
             }
         }
 
-        let allResults = [];  // Store all results for filtering
+        let allResults = [];
+        let currentDomain = 'scrape';
 
         function displayResults(results, method) {
-            allResults = results;  // Store for filtering
+            allResults = results;
+            renderTable(results, results.length);
+            document.getElementById('resultsContainer').style.display = 'block';
+        }
+
+        function renderTable(results, totalCount) {
             const tbody = document.getElementById('resultsBody');
-            const container = document.getElementById('resultsContainer');
             const countElement = document.getElementById('resultCount');
 
             tbody.innerHTML = '';
-            countElement.textContent = results.length;
+
+            // Display count as "X/Y" if filtered, or just "X" if showing all
+            if (totalCount && totalCount !== allResults.length) {
+                countElement.textContent = `${results.length}/${totalCount}`;
+            } else {
+                countElement.textContent = results.length;
+            }
 
             if (results.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="2" class="no-results">No results to display</td></tr>';
@@ -371,67 +408,37 @@
                     tbody.appendChild(row);
                 });
             }
-
-            container.style.display = 'block';
-            setupFilterListeners();
         }
 
         function setupFilterListeners() {
             const filterInput = document.getElementById('filterInput');
-            filterInput.addEventListener('input', (e) => {
-                const filterValue = e.target.value.trim().toLowerCase();
-                if (filterValue === '') {
-                    displayResults(allResults, '');
-                } else {
-                    applyFilter();
-                }
-            });
+            const filterType = document.getElementById('filterType');
+
+            // Remove old listeners to prevent stacking
+            filterInput.replaceWith(filterInput.cloneNode(true));
+            document.getElementById('filterType').replaceWith(filterType.cloneNode(true));
+
+            // Add fresh listeners
+            document.getElementById('filterInput').addEventListener('input', applyClientFilter);
+            document.getElementById('filterType').addEventListener('change', applyClientFilter);
         }
 
-        async function applyFilter() {
-            const filterInput = document.getElementById('filterInput').value.trim();
+        function applyClientFilter() {
+            const filterValue = document.getElementById('filterInput').value.trim().toLowerCase();
             const filterType = document.getElementById('filterType').value;
 
-            if (!filterInput) {
-                displayResults(allResults, '');
+            if (!filterValue) {
+                renderTable(allResults, allResults.length);
                 return;
             }
 
-            try {
-                const response = await fetch('/filter', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ type: filterType, value: filterInput })
-                });
+            // Filter on client immediately (no server call)
+            const filtered = allResults.filter(r => {
+                const fieldValue = filterType === 'name' ? r.name : r.url;
+                return fieldValue.toLowerCase().includes(filterValue);
+            });
 
-                const data = await response.json();
-                if (data.results) {
-                    displayFilteredResults(data.results, data.count, data.original_count);
-                }
-            } catch (error) {
-                console.error('Filter error:', error);
-            }
-        }
-
-        function displayFilteredResults(results, count, total) {
-            const tbody = document.getElementById('resultsBody');
-            const countElement = document.getElementById('resultCount');
-
-            tbody.innerHTML = '';
-            countElement.textContent = `${count}/${total}`;
-
-            if (results.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="2" class="no-results">No matches found</td></tr>';
-            } else {
-                results.forEach(result => {
-                    const row = document.createElement('tr');
-                    row.innerHTML = `
-                        <td><strong>${escapeHtml(result.name)}</strong></td>
-                        <td><a href="${escapeHtml(result.url)}" target="_blank">${escapeHtml(result.url)}</a></td>
-                    `;
-                    tbody.appendChild(row);
-                });
-            }
+            renderTable(filtered, allResults.length);
         }
 
         function resetFilter() {
@@ -440,9 +447,27 @@
         }
 
         function downloadCSV() {
+            const domain = currentDomain || 'scrape';
+            const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+            const filename = `${domain}_exhibitors_${date}.csv`;
+
+            // Build CSV content from allResults
+            const rows = [['name', 'url']];
+            allResults.forEach(r => {
+                rows.push([
+                    `"${r.name.replace(/"/g, '""')}"`,
+                    `"${r.url.replace(/"/g, '""')}"`
+                ]);
+            });
+            const csv = rows.map(r => r.join(',')).join('\n');
+
+            // Create blob and download
+            const blob = new Blob([csv], { type: 'text/csv' });
             const link = document.createElement('a');
-            link.href = '/download';
+            link.href = URL.createObjectURL(blob);
+            link.download = filename;
             link.click();
+            URL.revokeObjectURL(link.href);
         }
 
         function showStatus(type, message) {
@@ -457,9 +482,24 @@
             return div.innerHTML;
         }
 
+        // Browser mode info update
+        document.getElementById('useBrowser').addEventListener('change', (e) => {
+            const info = document.getElementById('modeInfo');
+            if (e.target.checked) {
+                info.textContent = '🌐 Browser mode (~15-30 sec/page)';
+            } else {
+                info.textContent = '⚡ Fast mode (~2-3 sec/page)';
+            }
+        });
+
         // Allow Enter key to scrape
         document.getElementById('urlInput').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') scrapeWebsite();
+        });
+
+        // Initialize filter listeners once at page load
+        document.addEventListener('DOMContentLoaded', () => {
+            setupFilterListeners();
         });
     </script>
 </body>

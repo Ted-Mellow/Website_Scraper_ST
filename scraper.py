@@ -7,6 +7,7 @@ import requests
 import json
 import csv
 import re
+import time
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from typing import List, Dict, Optional, Tuple
@@ -22,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class FlexibleScraper:
-    def __init__(self, base_url: str, output_file: Optional[str] = None):
+    def __init__(self, base_url: str, output_file: Optional[str] = None, delay_between_pages: float = 0.5):
         self.base_url = base_url
         self.output_file = output_file
         self.session = requests.Session()
@@ -31,25 +32,45 @@ class FlexibleScraper:
         })
         self.exhibitors: List[Dict[str, str]] = []
         self.extraction_method = "unknown"
+        self.page_param = None  # Cache the working page parameter
+        self.delay_between_pages = delay_between_pages
+        self.last_fetch_time = 0
+
+    def _detect_page_param(self) -> str:
+        """Detect which pagination parameter format works (runs once, cached)"""
+        if self.page_param:
+            return self.page_param
+
+        for param in ['?page=', '?p=', '?page_num=']:
+            url = f"{self.base_url}{param}1"
+            try:
+                response = self.session.head(url, timeout=5)
+                if response.status_code in [200, 404]:
+                    self.page_param = param
+                    logger.debug(f"Detected pagination format: {param}")
+                    return param
+            except Exception:
+                continue
+
+        self.page_param = '?page='
+        return self.page_param
 
     def fetch_page(self, page_num: int = 1, use_page_param: bool = True, use_browser: bool = False) -> Optional[str]:
-        """Fetch a single page and return HTML content"""
+        """Fetch a single page with rate limiting"""
         if use_browser:
             return self._fetch_page_with_browser(page_num, use_page_param)
 
+        # Rate limiting between requests
+        import time
+        elapsed = time.time() - self.last_fetch_time
+        if elapsed < self.delay_between_pages:
+            time.sleep(self.delay_between_pages - elapsed)
+        self.last_fetch_time = time.time()
+
         try:
             if use_page_param:
-                # Try common page parameter patterns
-                for param in ['?page=', '?p=', '?page_num=']:
-                    url = f"{self.base_url}{param}{page_num}"
-                    try:
-                        response = self.session.get(url, timeout=10)
-                        response.raise_for_status()
-                        return response.text
-                    except:
-                        continue
-                # If all params fail, try with &
-                url = f"{self.base_url}&page={page_num}"
+                param = self._detect_page_param()
+                url = f"{self.base_url}{param}{page_num}"
             else:
                 url = self.base_url
 
@@ -210,21 +231,27 @@ class FlexibleScraper:
             if not url or not name:
                 return None
 
-            return {
-                'name': name.strip(),
-                'url': url.strip()
-            }
+            # Strip and revalidate
+            name = name.strip()
+            url = url.strip()
+
+            if not name or not url:
+                return None
+
+            return {'name': name, 'url': url}
         except Exception as e:
-            logger.warning(f"Error extracting from item: {e}")
+            logger.debug(f"Error extracting from item: {e}")
             return None
 
     def scrape_all_pages(self, start_page: int = 1, max_pages: int = 20, use_browser: bool = False) -> Tuple[int, str]:
         """Scrape multiple pages with auto-stop when empty"""
         successful_pages = 0
         pages_scraped = 0
+        mode = "browser" if use_browser else "fast"
+        logger.info(f"Starting pagination scan: pages {start_page}-{start_page + max_pages - 1} ({mode} mode)")
 
         for page in range(start_page, start_page + max_pages):
-            logger.info(f"Scraping page {page}{'(browser)' if use_browser else ''}...")
+            logger.debug(f"Fetching page {page}...")
             html = self.fetch_page(page, use_browser=use_browser)
 
             if not html:
@@ -236,7 +263,7 @@ class FlexibleScraper:
 
             if companies:
                 self.exhibitors.extend(companies)
-                logger.info(f"Found {len(companies)} companies on page {page} (JSON-LD)")
+                logger.debug(f"Page {page}: {len(companies)} companies found (JSON-LD)")
                 self.extraction_method = "JSON-LD"
                 successful_pages += 1
                 pages_scraped += 1
@@ -245,14 +272,15 @@ class FlexibleScraper:
                 companies = self.parse_html_fallback(html, self.base_url)
                 if companies:
                     self.exhibitors.extend(companies)
-                    logger.info(f"Found {len(companies)} companies on page {page} (HTML fallback)")
+                    logger.debug(f"Page {page}: {len(companies)} companies found (HTML fallback)")
                     self.extraction_method = "HTML fallback"
                     successful_pages += 1
                     pages_scraped += 1
                 else:
-                    logger.info(f"No companies found on page {page}, stopping")
+                    logger.info(f"No results on page {page}, stopping pagination")
                     break
 
+        logger.info(f"Scrape complete: {successful_pages} successful pages, using {self.extraction_method}")
         return successful_pages, self.extraction_method
 
     def get_unique_exhibitors(self) -> List[Dict[str, str]]:
